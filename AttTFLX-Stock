@@ -1,0 +1,345 @@
+# 1. 数据导入和基础预处理
+data = "股票data2.csv"
+df = pd.read_csv(data, header=0, index_col=0)
+
+# 添加时间序列特征（差分）
+df['diff_1'] = df['y'].diff(1).fillna(0)  # 一阶差分
+df['diff_2'] = df['diff_1'].diff(1).fillna(0)  # 二阶差分
+
+print(f"Data shape: {df.shape}, Number of features: {len(df.columns)}")
+
+# 2. ACF和PACF分析（时间序列分析）
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+fig.suptitle('Autocorrelation and Partial Autocorrelation of Differenced Series', fontsize=16)
+
+# 绘制一阶差分的ACF和PACF
+plot_acf(df['diff_1'].dropna(), ax=axes[0, 0], lags=20, title='ACF of First Difference')
+plot_pacf(df['diff_1'].dropna(), ax=axes[0, 1], lags=20, title='PACF of First Difference')
+
+# 绘制二阶差分的ACF和PACF
+plot_acf(df['diff_2'].dropna(), ax=axes[1, 0], lags=20, title='ACF of Second Difference')
+plot_pacf(df['diff_2'].dropna(), ax=axes[1, 1], lags=20, title='PACF of Second Difference')
+
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.savefig('diff_acf_pacf_plots.png', dpi=300)
+plt.show()
+
+# 3. 数据准备和标准化
+df1 = df.drop(["y"], axis=1)
+wave = np.array(df1, dtype=np.float64)
+
+# 标准化数据
+mean = wave.mean(axis=0)
+wave -= mean
+std = wave.std(axis=0)
+wave = np.divide(wave, std, where=std != 0)  # 避免除以零
+target = df["y"].values
+
+# 4. 数据划分
+train_X, test_X, y_train, y_test = train_test_split(
+    wave, target, test_size=0.2, random_state=123
+)
+
+# 重塑为LSTM需要的3D格式
+x_train = train_X.reshape(train_X.shape[0], 1, train_X.shape[1])
+x_test = test_X.reshape(test_X.shape[0], 1, test_X.shape[1])
+
+print(f"Training data shape: {x_train.shape}, Test data shape: {x_test.shape}")
+
+# 5. 模型参数和自定义层
+ordered = 1.2
+k = 4
+
+# 计算系数的函数
+def coefficient(k, ordered):
+    t = 1
+    for i in range(0, k):
+        t = t * (1 - ((ordered + 1) / k))
+    return t
+
+coef = []
+for i in range(0, k):
+    coef.append(coefficient(i, ordered))
+
+# 自定义注意力层
+class AttentionLayer(layers.Layer):
+    def __init__(self, **kwargs):
+        super(AttentionLayer, self).__init__(**kwargs)
+
+    def build(self, input_shape):
+        self.dense = Dense(1, activation='tanh')
+        self.flatten = Flatten()
+        self.softmax = Activation('softmax')
+        self.repeat = RepeatVector(input_shape[-1])
+        self.permute = Permute([2, 1])
+        self.multiply = Multiply()
+        super(AttentionLayer, self).build(input_shape)
+
+    def call(self, inputs):
+        attention = self.dense(inputs)
+        attention = self.flatten(attention)
+        attention = self.softmax(attention)
+        attention = self.repeat(attention)
+        attention = self.permute(attention)
+        return self.multiply([inputs, attention])
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+# 自定义Sigmoid激活函数层
+class CustomSigmoid(layers.Layer):
+    def __init__(self, **kwargs):
+        super(CustomSigmoid, self).__init__(**kwargs)
+
+    @tf.custom_gradient
+    def custom_sigmoid(self, x):
+        y = tf.sigmoid(x)
+
+        def grad(dy):
+            p = 0
+            for i in range(0, k):
+                j = i
+                temp1 = tf.sigmoid(x + j)
+                temp2 = tf.sigmoid(x - j)
+                temp = (1 / (2 * np.sin(np.pi * ordered / 2))) * coef[i] * (temp2 - temp1)
+                p += temp
+            return dy * p
+
+        return y, grad
+
+    def call(self, inputs):
+        return self.custom_sigmoid(inputs)
+
+# 6. 构建模型
+tf.keras.backend.clear_session()  # 清除之前的模型
+model = Sequential()
+model.add(Input(shape=(1, wave.shape[1])))
+model.add(Bidirectional(LSTM(64, return_sequences=True,
+                             kernel_regularizer=regularizers.l2(0.01))))
+model.add(Dropout(0.3))
+model.add(AttentionLayer())  # 使用自定义注意力层
+model.add(Bidirectional(LSTM(32)))
+model.add(Dropout(0.3))
+model.add(CustomSigmoid())  # 使用自定义sigmoid层
+model.add(Dense(16, activation='relu', kernel_regularizer=regularizers.l2(0.01)))
+model.add(Dense(1))
+model.add(Activation("sigmoid"))
+
+model.summary()
+
+# 7. 编译和训练模型
+optimizer = Adam(learning_rate=0.001)
+model.compile(optimizer=optimizer, loss="mse", metrics=["mae"])
+
+# 早停机制
+early_stop = EarlyStopping(
+    monitor='val_loss',
+    patience=15,
+    restore_best_weights=True,
+    min_delta=0.001,
+    verbose=1
+)
+
+start_time = time.time()
+history = model.fit(
+    x_train,
+    y_train,
+    epochs=200,
+    batch_size=32,
+    validation_split=0.25,
+    callbacks=[early_stop],
+    verbose=2
+)
+end_time = time.time()
+
+# 8. 预测和评估
+y_pred = model.predict(x_test)
+
+# 残差增强预测函数
+def enhance_prediction(y_true, y_pred):
+    """使用XGBoost提升残差预测"""
+    residuals = y_true - y_pred.flatten()
+    model = XGBRegressor(n_estimators=100, learning_rate=0.05)
+    model.fit(y_pred, residuals)
+    enhanced = y_pred.flatten() + model.predict(y_pred)
+    return enhanced
+
+# 应用残差增强
+y_pred_enhanced = enhance_prediction(y_test, y_pred)
+
+# 计算指标
+R2 = r2_score(y_test, y_pred_enhanced)
+MAPE = mean_absolute_percentage_error(y_test, y_pred_enhanced)
+RMSE = np.sqrt(mean_squared_error(y_test, y_pred_enhanced))
+MAE = mean_absolute_error(y_test, y_pred_enhanced)
+
+print('Test set R²: %.8f ' % R2,
+      'MAPE: %.8f ' % MAPE,
+      'RMSE: %.8f ' % RMSE,
+      'MAE: %.8f ' % MAE)
+
+# 9. 保存结果和可视化
+os.makedirs('./sigmoidtestpred', exist_ok=True)
+os.makedirs('./sigmoidloss', exist_ok=True)
+
+pd.DataFrame(y_test).to_csv(f'./sigmoidtestpred/{ordered}y_test6.csv')
+pd.DataFrame(y_pred_enhanced).to_csv(f'./sigmoidtestpred/{ordered}y_pred6.csv')
+pd.DataFrame(history.history['val_loss']).to_csv(f'./sigmoidloss/{ordered}GLloss6.csv')
+
+elapsed_time = end_time - start_time
+print(f"Ordered parameter: {ordered}")
+print(f"k parameter: {k}")
+print(f"Training time: {elapsed_time:.2f} seconds")
+
+# 10. 可视化函数
+def plot_accuracy_density(obs, pre, x_min=None, y_min=None, x_max=None, y_max=None,
+                          colormap='viridis', xlabel='True Value', ylabel='Predicted Value'):
+    """
+    绘制精度验证图
+    """
+    # 自动确定坐标范围
+    if x_min is None: x_min = min(np.min(obs), np.min(pre))
+    if y_min is None: y_min = min(np.min(obs), np.min(pre))
+    if x_max is None: x_max = max(np.max(obs), np.max(pre))
+    if y_max is None: y_max = max(np.max(obs), np.max(pre))
+
+    # 创建图形
+    fig, ax = plt.subplots(figsize=(8, 8))
+
+    # 设置坐标范围
+    ax.set_xlim((x_min, x_max))
+    ax.set_ylim((y_min, y_max))
+
+    # 计算点密度
+    xy = np.vstack([obs, pre])
+    z = stats.gaussian_kde(xy)
+    idx = z(xy).argsort()
+
+    # 绘制散点图
+    scatter = ax.scatter(obs[idx], pre[idx], marker='.', c=z(xy)[idx], s=86, cmap=colormap)
+
+    # 回归线参数
+    x = np.linspace(x_min, x_max, 100)
+    parameter = np.polyfit(obs, pre, 1)
+    slope = round(parameter[0], 3)
+    intercept = round(parameter[1], 3)
+    regression_line = slope * x + intercept
+
+    # 绘制回归线和1:1线
+    ax.plot(x, regression_line, linewidth=1.5, color='green', alpha=1, label=f'AttTFLX({ordered})')
+    ax.plot(x, x, linewidth=1, color='k', alpha=0.8, linestyle='--')
+
+    # 设置图例
+    leg = ax.legend(
+        loc='lower right',
+        fontsize=14,
+        frameon=True,
+        framealpha=0.8,
+        edgecolor='black',
+        facecolor='white',
+        borderpad=0.6,
+        handlelength=1.5
+    )
+    leg.get_frame().set_linewidth(1.5)
+
+    # 设置坐标轴标签
+    ax.set_xlabel('True Value', fontsize=14)
+    ax.set_ylabel('Predicted Value', fontsize=14)
+    plt.tick_params(axis='both', which='major', labelsize=10)
+
+    # 计算误差指标
+    r2 = r2_score(obs, pre)
+    mape = mean_absolute_percentage_error(obs, pre)
+    rmse = np.sqrt(mean_squared_error(obs, pre))
+    mae = mean_absolute_error(obs, pre)
+
+    # 添加标注
+    text = (
+        f"$R^2 = {r2:.5f}$\n"
+        f"MAPE = {mape:.5f}\n"
+        f"RMSE = {rmse:.5f}\n"
+        f"MAE = {mae:.5f}"
+    )
+    ax.text(0.02, 0.98, text, fontsize=14, transform=ax.transAxes,
+            verticalalignment='top', horizontalalignment='left')
+
+    # 添加colorbar
+    cbar = plt.colorbar(scatter, ax=ax, shrink=0.75, pad=0.05)
+    cbar.set_label('Density', fontsize=12)
+    ax.set_aspect('equal')
+
+    # 设置标题
+    plt.title('Sigmoid Activation Function', fontsize=16)
+    plt.tight_layout()
+    plt.savefig(f'sigmoid_accuracy_{r2:.4f}.png', dpi=300)
+    plt.show()
+
+# 11. 损失曲线可视化
+plt.figure(figsize=(12, 8))
+
+# 绘制训练损失曲线
+plt.plot(history.history['loss'],
+         linestyle='-',
+         linewidth=2.5,
+         color='#FF6B6B',
+         marker='o',
+         markersize=4,
+         markerfacecolor='#FF6B6B',
+         markeredgecolor='white',
+         markeredgewidth=0.8,
+         alpha=0.9,
+         label='Training Loss')
+
+# 绘制验证损失曲线
+plt.plot(history.history['val_loss'],
+         linestyle='--',
+         linewidth=2.5,
+         color='#4ECDC4',
+         marker='s',
+         markersize=4,
+         markerfacecolor='#4ECDC4',
+         markeredgecolor='white',
+         markeredgewidth=0.8,
+         alpha=0.9,
+         label='Validation Loss')
+
+# 标记最佳验证损失点
+best_epoch = np.argmin(history.history['val_loss'])
+best_val_loss = np.min(history.history['val_loss'])
+plt.plot(best_epoch, best_val_loss,
+         marker='D',
+         markersize=10,
+         color='#45B7D1',
+         markeredgecolor='white',
+         markeredgewidth=1.5,
+         label=f'Best Validation Loss (Epoch {best_epoch})')
+
+# 添加网格线
+plt.grid(True, linestyle=':', linewidth=0.7, alpha=0.7)
+
+# 设置标题和标签
+plt.title('Model Training Loss Curve', fontsize=16, fontweight='bold', pad=20)
+plt.ylabel('Loss', fontsize=12, fontweight='bold')
+plt.xlabel('Epoch', fontsize=12, fontweight='bold')
+
+# 设置图例
+plt.legend(loc='upper right', frameon=True, fancybox=True, shadow=True, fontsize=10)
+
+# 设置坐标轴范围
+plt.xlim(0, len(history.history['loss']))
+max_loss = max(max(history.history['loss']), max(history.history['val_loss']))
+plt.ylim(0, max_loss * 1.05)
+
+# 添加性能指标文本
+metrics_text = (f"Final Training Loss: {history.history['loss'][-1]:.4f}\n"
+                f"Final Validation Loss: {history.history['val_loss'][-1]:.4f}\n"
+                f"Best Validation Loss: {best_val_loss:.4f} (Epoch {best_epoch})")
+plt.text(0.02, 0.98, metrics_text, transform=plt.gca().transAxes,
+         verticalalignment='top', horizontalalignment='left',
+         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8),
+         fontsize=10)
+
+# 保存图像
+plt.tight_layout()
+plt.savefig('enhanced_training_loss.png', dpi=300, bbox_inches='tight')
+plt.show()
